@@ -1,0 +1,195 @@
+name: Build LineageOS 20 - Infinix X6528
+
+on:
+  workflow_dispatch:
+    inputs:
+      build_type:
+        description: 'Build type (userdebug/user/eng)'
+        required: true
+        default: 'userdebug'
+      clean_build:
+        description: 'Clean build? (true/false)'
+        required: true
+        default: 'false'
+
+jobs:
+  build:
+    runs-on: namespace-profile-speed
+    timeout-minutes: 720
+
+    steps:
+      - name: Setup build environment
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y \
+            bc bison build-essential ccache curl flex g++-multilib gcc-multilib \
+            git gnupg gperf imagemagick lib32ncurses5-dev lib32readline-dev \
+            lib32z1-dev liblz4-tool libncurses5 libncurses5-dev libsdl1.2-dev \
+            libssl-dev libxml2 libxml2-utils lzop pngcrush rsync schedtool \
+            squashfs-tools xsltproc zip zlib1g-dev python3 python3-pip \
+            openjdk-11-jdk repo git-lfs
+          pip3 install --upgrade pip
+
+      - name: Configure git
+        run: |
+          git config --global user.email "build@github.com"
+          git config --global user.name "GitHub Actions"
+          git config --global color.ui false
+
+      - name: Setup ccache
+        run: |
+          mkdir -p ~/.ccache
+          ccache -M 50G
+          ccache -o compression=true
+          echo "CCACHE_DIR=$HOME/.ccache" >> $GITHUB_ENV
+          echo "USE_CCACHE=1" >> $GITHUB_ENV
+          echo "CCACHE_EXEC=$(which ccache)" >> $GITHUB_ENV
+
+      - name: Cache ccache
+        uses: actions/cache@v4
+        with:
+          path: ~/.ccache
+          key: ccache-lineage20-x6528-${{ github.run_id }}
+          restore-keys: |
+            ccache-lineage20-x6528-
+
+      - name: Initialize LineageOS 20 repo
+        run: |
+          mkdir -p ~/android/lineage
+          cd ~/android/lineage
+          repo init \
+            --depth=1 \
+            -u https://github.com/LineageOS/android.git \
+            -b lineage-20.0 \
+            --git-lfs
+
+      - name: Create local manifests
+        run: |
+          mkdir -p ~/android/lineage/.repo/local_manifests
+          cat > ~/android/lineage/.repo/local_manifests/x6528.xml << 'EOF'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <manifest>
+            <project name="SPEEDFIRE7/android_device_infinix_X6528"
+                     path="device/infinix/X6528"
+                     remote="github"
+                     revision="lineage-20" />
+            <project name="SPEEDFIRE7/android_kernel_infinix_X6528"
+                     path="kernel/infinix/X6528"
+                     remote="github"
+                     revision="lineage-20" />
+          </manifest>
+          EOF
+
+      - name: Sync sources
+        run: |
+          cd ~/android/lineage
+          repo sync \
+            --current-branch \
+            --no-clone-bundle \
+            --no-tags \
+            --optimized-fetch \
+            -j$(nproc --all) \
+            2>&1 | tee /tmp/sync.log
+          echo "Sync complete"
+
+      - name: Download vendor blobs from release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          mkdir -p ~/android/lineage/vendor/infinix/X6528
+          cd /tmp
+
+          echo "Downloading vendor_blobs.tar.gz from release..."
+          gh release download vendor-blobs \
+            --repo SPEEDFIRE7/android_vendor_infinix_X6528 \
+            --pattern "vendor_blobs.tar.gz*" \
+            --dir /tmp/vendor_dl
+
+          ls -lh /tmp/vendor_dl/
+
+          # Reassemble if split
+          if ls /tmp/vendor_dl/vendor_blobs.tar.gz.part_* 2>/dev/null; then
+            echo "Reassembling split parts..."
+            cat /tmp/vendor_dl/vendor_blobs.tar.gz.part_* > /tmp/vendor_dl/vendor_blobs.tar.gz
+          fi
+
+          echo "Extracting vendor..."
+          tar -I pigz -xf /tmp/vendor_dl/vendor_blobs.tar.gz \
+            -C ~/android/lineage/vendor/infinix/X6528
+
+          echo "Vendor contents:"
+          ls ~/android/lineage/vendor/infinix/X6528/
+
+      - name: Setup build
+        run: |
+          cd ~/android/lineage
+          source build/envsetup.sh
+          lunch lineage_X6528-${{ github.event.inputs.build_type }}
+
+      - name: Clean if requested
+        if: github.event.inputs.clean_build == 'true'
+        run: |
+          cd ~/android/lineage
+          source build/envsetup.sh
+          lunch lineage_X6528-${{ github.event.inputs.build_type }}
+          make clean
+
+      - name: Build LineageOS
+        run: |
+          cd ~/android/lineage
+          source build/envsetup.sh
+          lunch lineage_X6528-${{ github.event.inputs.build_type }}
+
+          make bacon \
+            -j$(nproc --all) \
+            2>&1 | tee /tmp/build.log
+
+          echo "=== Build Output ==="
+          ls -lh out/target/product/X6528/*.zip 2>/dev/null || echo "No zip found"
+
+      - name: Upload ROM to release
+        if: success()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          cd ~/android/lineage
+          ZIP=$(ls out/target/product/X6528/lineage-*.zip 2>/dev/null | head -1)
+          if [ -z "$ZIP" ]; then
+            echo "No ROM zip found!"
+            exit 1
+          fi
+
+          ZIPNAME=$(basename "$ZIP")
+          SIZE=$(du -sh "$ZIP" | cut -f1)
+          DATE=$(date +%Y%m%d)
+          TAG="lineage-20-${DATE}"
+
+          echo "Uploading: $ZIPNAME ($SIZE)"
+
+          gh release create "$TAG" "$ZIP" \
+            --repo SPEEDFIRE7/android_vendor_infinix_X6528 \
+            --title "LineageOS 20 - Infinix X6528 (${DATE})" \
+            --notes "## LineageOS 20 — Infinix Hot 40i (X6528)
+
+          - **Device**: Infinix Hot 40i (X6528)
+          - **Chipset**: Unisoc T606
+          - **Android**: 13 (LineageOS 20)
+          - **Build type**: ${{ github.event.inputs.build_type }}
+          - **Build date**: ${DATE}
+          - **Size**: ${SIZE}
+
+          ### Installation
+          1. Boot to recovery
+          2. Flash the ZIP
+          3. Wipe data if upgrading from stock
+
+          ### Notes
+          Built from source via GitHub Actions."
+
+      - name: Upload build log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log-${{ github.run_id }}
+          path: /tmp/build.log
+          retention-days: 7
