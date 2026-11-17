@@ -12,6 +12,9 @@ on:
         required: true
         default: 'false'
 
+permissions:
+  contents: write
+
 jobs:
   build:
     runs-on: namespace-profile-speed
@@ -21,13 +24,14 @@ jobs:
       - name: Setup build environment
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y \
-            bc bison build-essential ccache curl flex g++-multilib gcc-multilib \
-            git gnupg gperf imagemagick lib32ncurses5-dev lib32readline-dev \
-            lib32z1-dev liblz4-tool libncurses5 libncurses5-dev libsdl1.2-dev \
-            libssl-dev libxml2 libxml2-utils lzop pngcrush rsync schedtool \
-            squashfs-tools xsltproc zip zlib1g-dev python3 python3-pip \
-            openjdk-11-jdk repo git-lfs
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
+            bc bison build-essential ccache curl flex \
+            g++-multilib gcc-multilib git gnupg gperf imagemagick \
+            lib32readline-dev lib32z1-dev liblz4-tool \
+            libncurses-dev libsdl1.2-dev libssl-dev \
+            libxml2 libxml2-utils lzop pngcrush rsync schedtool \
+            squashfs-tools xsltproc zip zlib1g-dev \
+            python3 python3-pip openjdk-11-jdk repo git-lfs pigz
           pip3 install --upgrade pip
 
       - name: Configure git
@@ -90,34 +94,29 @@ jobs:
             --optimized-fetch \
             -j$(nproc --all) \
             2>&1 | tee /tmp/sync.log
-          echo "Sync complete"
 
       - name: Download vendor blobs from release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           mkdir -p ~/android/lineage/vendor/infinix/X6528
-          cd /tmp
+          mkdir -p /tmp/vendor_dl
 
-          echo "Downloading vendor_blobs.tar.gz from release..."
           gh release download vendor-blobs \
             --repo SPEEDFIRE7/android_vendor_infinix_X6528 \
-            --pattern "vendor_blobs.tar.gz*" \
+            --pattern "vendor_blobs*" \
             --dir /tmp/vendor_dl
 
           ls -lh /tmp/vendor_dl/
 
-          # Reassemble if split
-          if ls /tmp/vendor_dl/vendor_blobs.tar.gz.part_* 2>/dev/null; then
-            echo "Reassembling split parts..."
+          if ls /tmp/vendor_dl/vendor_blobs.tar.gz.part_* &>/dev/null; then
+            echo "Reassembling parts..."
             cat /tmp/vendor_dl/vendor_blobs.tar.gz.part_* > /tmp/vendor_dl/vendor_blobs.tar.gz
           fi
 
-          echo "Extracting vendor..."
           tar -I pigz -xf /tmp/vendor_dl/vendor_blobs.tar.gz \
             -C ~/android/lineage/vendor/infinix/X6528
 
-          echo "Vendor contents:"
           ls ~/android/lineage/vendor/infinix/X6528/
 
       - name: Setup build
@@ -139,13 +138,8 @@ jobs:
           cd ~/android/lineage
           source build/envsetup.sh
           lunch lineage_X6528-${{ github.event.inputs.build_type }}
-
-          make bacon \
-            -j$(nproc --all) \
-            2>&1 | tee /tmp/build.log
-
-          echo "=== Build Output ==="
-          ls -lh out/target/product/X6528/*.zip 2>/dev/null || echo "No zip found"
+          make bacon -j$(nproc --all) 2>&1 | tee /tmp/build.log
+          ls -lh out/target/product/X6528/*.zip
 
       - name: Upload ROM to release
         if: success()
@@ -154,17 +148,11 @@ jobs:
         run: |
           cd ~/android/lineage
           ZIP=$(ls out/target/product/X6528/lineage-*.zip 2>/dev/null | head -1)
-          if [ -z "$ZIP" ]; then
-            echo "No ROM zip found!"
-            exit 1
-          fi
+          [ -z "$ZIP" ] && echo "No zip found!" && exit 1
 
-          ZIPNAME=$(basename "$ZIP")
           SIZE=$(du -sh "$ZIP" | cut -f1)
           DATE=$(date +%Y%m%d)
           TAG="lineage-20-${DATE}"
-
-          echo "Uploading: $ZIPNAME ($SIZE)"
 
           gh release create "$TAG" "$ZIP" \
             --repo SPEEDFIRE7/android_vendor_infinix_X6528 \
@@ -181,10 +169,7 @@ jobs:
           ### Installation
           1. Boot to recovery
           2. Flash the ZIP
-          3. Wipe data if upgrading from stock
-
-          ### Notes
-          Built from source via GitHub Actions."
+          3. Wipe data if upgrading from stock"
 
       - name: Upload build log on failure
         if: failure()
