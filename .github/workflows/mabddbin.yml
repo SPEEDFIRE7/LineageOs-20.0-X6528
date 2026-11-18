@@ -147,248 +147,32 @@ jobs:
 
           ls ~/android/lineage/vendor/infinix/X6528/
 
-      - name: Remove vendor vintf manifests that duplicate in-tree ones
-        run: |
-          cat > /tmp/dedupe_vintf.py << 'PYEOF'
-          import os, re, sys
-
-          TOP = os.path.expanduser("~/android/lineage")
-          VENDOR = os.path.join(TOP, "vendor/infinix/X6528")
-          BP = os.path.join(VENDOR, "Android.bp")
-          MK = os.path.join(VENDOR, "X6528-vendor.mk")
-          ALWAYS = {"face-default.xml"}
-
-          def fix_continuations(ls):
-              res = list(ls)
-              for k in range(len(res) - 1):
-                  nxt = res[k + 1]
-                  if res[k].rstrip().endswith("\\") and (nxt.strip() == "" or not nxt[0].isspace()):
-                      res[k] = res[k].rstrip()[:-1].rstrip()
-              if res and res[-1].rstrip().endswith("\\"):
-                  res[-1] = res[-1].rstrip()[:-1].rstrip()
-              return res
-
-
-          lines = open(BP).read().split("\n")
-
-          # 1) parse top-level blocks
-          blocks = []  # (start, end, text)
-          i = 0
-          while i < len(lines):
-              l = lines[i]
-              if l and not l[0].isspace() and l.rstrip().endswith("{"):
-                  j = i
-                  while j < len(lines) and lines[j].rstrip() != "}":
-                      j += 1
-                  blocks.append((i, j, "\n".join(lines[i:j + 1])))
-                  i = j + 1
-              else:
-                  i += 1
-
-          # 2) vendor vintf-manifest modules -> xml basename
-          cand = {}  # module name -> (xml basename, start, end)
-          for s, e, t in blocks:
-              if not re.search(r'sub_dir:\s*"vintf/manifest"', t):
-                  continue
-              n = re.search(r'name:\s*"([^"]+)"', t)
-              src = re.search(r'src:\s*"([^"]+)"', t)
-              fn = re.search(r'filename:\s*"([^"]+)"', t)
-              if not n or not src:
-                  continue
-              base = os.path.basename(fn.group(1) if fn else src.group(1))
-              cand[n.group(1)] = (base, s, e)
-          print(f"vendor vintf manifest modules: {len(cand)}")
-
-          # 3) collect every .xml basename referenced by build files OUTSIDE the vendor/device trees
-          wanted = {v[0] for v in cand.values()}
-          found = {}
-          skip_prefix = (os.path.join(TOP, "out"), VENDOR,
-                         os.path.join(TOP, "device/infinix"), os.path.join(TOP, ".repo"))
-          xml_re = re.compile(r'([\w./@+-]+\.xml)')
-          for root, dirs, files in os.walk(TOP):
-              if root.startswith(skip_prefix):
-                  dirs[:] = []
-                  continue
-              dirs[:] = [d for d in dirs if d not in (".git", "out", ".repo")]
-              for f in files:
-                  if not f.endswith((".bp", ".mk")):
-                      continue
-                  p = os.path.join(root, f)
-                  try:
-                      txt = open(p, errors="ignore").read()
-                  except OSError:
-                      continue
-                  for m in xml_re.finditer(txt):
-                      b = os.path.basename(m.group(1))
-                      if b in wanted and b not in found:
-                          found[b] = os.path.relpath(p, TOP)
-
-          # 4) decide
-          drop = {name: v for name, v in cand.items()
-                  if v[0] in found or v[0] in ALWAYS}
-          for name, (b, s, e) in sorted(drop.items()):
-              print(f"DROP {name} ({b}) - also defined in {found.get(b, 'forced list')}")
-
-          # 5) rewrite Android.bp without those blocks
-          kill = set()
-          for _, s, e in drop.values():
-              kill.update(range(s, e + 1))
-          open(BP, "w").write("\n".join(l for k, l in enumerate(lines) if k not in kill))
-
-          # 6) remove PRODUCT_PACKAGES entries
-          mk = open(MK).read().split("\n")
-          names = set(drop)
-          mk = [l for l in mk if not (re.fullmatch(r'\s*(\S+)\s*\\?\s*', l) and
-                                      re.fullmatch(r'\s*(\S+)\s*\\?\s*', l).group(1).rstrip("\\") in names)]
-          open(MK, "w").write("\n".join(fix_continuations(mk)))
-          print(f"removed {len(drop)} module(s)")
-          PYEOF
-          python3 /tmp/dedupe_vintf.py
-
-      - name: Resolve remaining duplicate install targets (iterative)
-        run: |
-          cat > /tmp/rm_target.py << 'PYEOF'
-          import glob, os, re, sys
-
-          B = sys.argv[1]
-          TOP = os.path.expanduser("~/android/lineage")
-          DEV = os.path.join(TOP, "device/infinix/X6528")
-          VENDOR = os.path.join(TOP, "vendor/infinix/X6528")
-          BP = os.path.join(VENDOR, "Android.bp")
-
-
-          def fix_continuations(ls):
-              res = list(ls)
-              for k in range(len(res) - 1):
-                  nxt = res[k + 1]
-                  if res[k].rstrip().endswith("\\") and (nxt.strip() == "" or not nxt[0].isspace()):
-                      res[k] = res[k].rstrip()[:-1].rstrip()
-              if res and res[-1].rstrip().endswith("\\"):
-                  res[-1] = res[-1].rstrip()[:-1].rstrip()
-              return res
-
-
-          def mk_files():
-              out = []
-              for base in (DEV, VENDOR):
-                  for root, _, files in os.walk(base):
-                      out += [os.path.join(root, f) for f in files if f.endswith(".mk")]
-              return out
-
-
-          # candidate in-tree module names for this installed file
-          cands = {B}
-          stem = re.sub(r'\.(xml|rc|so|conf)$', '', B)
-          cands.add(stem)
-          if re.search(r'(32|64)$', stem):
-              cands.add(re.sub(r'(32|64)$', '', stem))
-
-          # 1) the in-tree module is pulled in by a PRODUCT_PACKAGES entry of OUR device/vendor makefiles
-          #    -> drop that entry; the vendor blob (copy rule) is kept.
-          changed = []
-          for p in mk_files():
-              ls = open(p).read().split("\n")
-              out = []
-              for l in ls:
-                  m = re.fullmatch(r'\s*(\S+?)\s*\\?\s*', l)
-                  if m and m.group(1) in cands and ":" not in l and "=" not in l:
-                      changed.append((p, l.strip()))
-                      continue
-                  out.append(l)
-              if len(out) != len(ls):
-                  open(p, "w").write("\n".join(fix_continuations(out)))
-          for p, l in changed:
-              print(f"  dropped package entry '{l}' from {os.path.relpath(p, TOP)}")
-          if changed:
-              sys.exit(0)
-
-          # 2) a vendor Android.bp module installing the same file (e.g. vintf manifests)
-          if os.path.exists(BP):
-              lines = open(BP).read().split("\n")
-              blocks, i = [], 0
-              while i < len(lines):
-                  l = lines[i]
-                  if l and not l[0].isspace() and l.rstrip().endswith("{"):
-                      j = i
-                      while j < len(lines) and lines[j].rstrip() != "}":
-                          j += 1
-                      blocks.append((i, j, "\n".join(lines[i:j + 1])))
-                      i = j + 1
-                  else:
-                      i += 1
-              names, kill = set(), set()
-              for s, e, t in blocks:
-                  n = re.search(r'name:\s*"([^"]+)"', t)
-                  src = re.search(r'src:\s*"([^"]+)"', t)
-                  fn = re.search(r'filename:\s*"([^"]+)"', t)
-                  base = os.path.basename(fn.group(1)) if fn else (os.path.basename(src.group(1)) if src else None)
-                  if n and base == B:
-                      names.add(n.group(1))
-                      kill.update(range(s, e + 1))
-                      print(f"  removing vendor Android.bp module {n.group(1)}")
-              if names:
-                  open(BP, "w").write("\n".join(l for k, l in enumerate(lines) if k not in kill))
-                  for p in mk_files():
-                      ls = open(p).read().split("\n")
-                      out = [l for l in ls
-                             if not (re.fullmatch(r'\s*(\S+?)\s*\\?\s*', l) and re.fullmatch(r'\s*(\S+?)\s*\\?\s*', l).group(1) in names)]
-                      if len(out) != len(ls):
-                          open(p, "w").write("\n".join(fix_continuations(out)))
-                  sys.exit(0)
-
-          # 3) two COPY rules for the same destination: keep the device-tree one, drop the vendor one
-          copy_re = re.compile(r'[:/]' + re.escape(B) + r'\s*\\?\s*$')
-          hits = []
-          for p in mk_files():
-              for l in open(p).read().split("\n"):
-                  if ":" in l and copy_re.search(l):
-                      hits.append((p, l))
-          if len(hits) >= 2:
-              vend = [(p, l) for p, l in hits if p.startswith(VENDOR)]
-              if vend and len(vend) < len(hits):
-                  for p, l in vend:
-                      ls = open(p).read().split("\n")
-                      ls = [x for x in ls if x != l]
-                      open(p, "w").write("\n".join(fix_continuations(ls)))
-                      print(f"  removed duplicate vendor copy rule: {l.strip()}")
-                  sys.exit(0)
-
-          print(f"  !! no safe automatic fix for {B}")
-          for p, l in hits:
-              print(f"     copy rule in {os.path.relpath(p, TOP)}: {l.strip()}")
-          sys.exit(3)
-          PYEOF
-
-          cd ~/android/lineage
-          source build/envsetup.sh
-          lunch lineage_X6528-${{ github.event.inputs.build_type }}
-
-          for n in $(seq 1 25); do
-            echo "=== Check #$n ==="
-            if m nothing > /tmp/dup_check.log 2>&1; then
-              echo "No more duplicate targets."
-              break
-            fi
-            T=$(grep -oP "overriding commands for target \`\K[^']+" /tmp/dup_check.log | head -1)
-            if [ -z "$T" ]; then
-              echo "Failed with a different error:"
-              grep -n -E "FAILED|error:" /tmp/dup_check.log | head -20
-              tail -30 /tmp/dup_check.log
-              exit 1
-            fi
-            echo "Duplicate target: $T"
-            python3 /tmp/rm_target.py "$(basename "$T")" || {
-              echo "No safe automatic fix for $(basename "$T"); stopping."
-              exit 1
-            }
-          done
-
-      - name: Show prebuilt kernel config
+      - name: Remove face-default duplicate (module + package entry)
         run: |
           cd ~/android/lineage
-          grep -rn -E "PREBUILT_KERNEL|FORCE_PREBUILT|PREBUILT_DTB|PREBUILT_DTBO" \
-            device/infinix/X6528/BoardConfig.mk || echo "(no prebuilt kernel lines found!)"
-          ls -lh device/infinix/X6528/prebuilts/ || true
+          V=vendor/infinix/X6528
+
+          echo "=== Before ==="
+          grep -rn "face-default" device/infinix/X6528 $V \
+            --include=*.mk --include=*.bp || true
+          sed -n '180,190p' device/infinix/X6528/BoardConfig.mk
+
+          # 1) remove the prebuilt_etc "face-default" module from vendor Android.bp
+          python3 - "$V/Android.bp" << 'PYEOF'
+          import re, sys
+          p = sys.argv[1]
+          s = open(p).read()
+          s2, n = re.subn(r'prebuilt_etc\s*\{[^}]*name:\s*"face-default"[^}]*\}\s*', '', s)
+          open(p, 'w').write(s2)
+          print(f"removed {n} face-default module(s)")
+          PYEOF
+
+          # 2) remove it from PRODUCT_PACKAGES
+          sed -i '/^[[:space:]]*face-default[[:space:]]*\\$/d' $V/X6528-vendor.mk
+
+          echo "=== After ==="
+          grep -rn "face-default" device/infinix/X6528 $V \
+            --include=*.mk --include=*.bp || echo "(none)"
 
       - name: Clean if requested
         if: github.event.inputs.clean_build == 'true'
@@ -414,32 +198,8 @@ jobs:
           cd ~/android/lineage
           ZIP=$(ls out/target/product/X6528/lineage-*.zip 2>/dev/null | head -1)
           [ -z "$ZIP" ] && echo "No zip found!" && exit 1
-
-          SIZE=$(du -sh "$ZIP" | cut -f1)
-          DATE=$(date +%Y%m%d)
-          TAG="lineage-20-${DATE}"
-
+          TAG="lineage20-x6528-$(date +%Y%m%d-%H%M)"
           gh release create "$TAG" "$ZIP" \
-            --repo SPEEDFIRE7/android_vendor_infinix_X6528 \
-            --title "LineageOS 20 - Infinix X6528 (${DATE})" \
-            --notes "## LineageOS 20 — Infinix Hot 40i (X6528)
-
-          - **Device**: Infinix Hot 40i (X6528)
-          - **Chipset**: Unisoc T606
-          - **Android**: 13 (LineageOS 20)
-          - **Build type**: ${{ github.event.inputs.build_type }}
-          - **Build date**: ${DATE}
-          - **Size**: ${SIZE}
-
-          ### Installation
-          1. Boot to recovery
-          2. Flash the ZIP
-          3. Wipe data if upgrading from stock"
-
-      - name: Upload build log on failure
-        if: failure()
-        uses: actions/upload-artifact@v4
-        with:
-          name: build-log-${{ github.run_id }}
-          path: /tmp/build.log
-          retention-days: 7
+            --repo "${{ github.repository }}" \
+            --title "LineageOS 20 X6528 - $(date +%Y-%m-%d)" \
+            --notes "Build type: ${{ github.event.inputs.build_type }}"
