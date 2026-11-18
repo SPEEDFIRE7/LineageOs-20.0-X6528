@@ -147,7 +147,7 @@ jobs:
 
           ls ~/android/lineage/vendor/infinix/X6528/
 
-      -       - name: Remove face-default duplicate (module + package entry)
+      - name: Remove face-default duplicate (module + package entry)
         run: |
           cd ~/android/lineage
           V=vendor/infinix/X6528
@@ -160,7 +160,6 @@ jobs:
           p = sys.argv[1]
           lines = open(p).read().split("\n")
           out, i, removed = [], 0, 0
-          # find each top-level block (starts at column 0 with "xxx {", ends at "}" at column 0)
           while i < len(lines):
               l = lines[i]
               if l and not l[0].isspace() and l.rstrip().endswith("{"):
@@ -168,8 +167,7 @@ jobs:
                   while j < len(lines) and lines[j].rstrip() != "}":
                       j += 1
                   block = lines[i:j+1]
-                  if any('name: "face-default"' in b.replace("\t", " ") or
-                         "name:\t\"face-default\"" in b for b in block):
+                  if any('name: "face-default"' in b.replace("\t", " ") for b in block):
                       print("Removing block:\n" + "\n".join(block))
                       removed += 1
                       i = j + 1
