@@ -80,18 +80,41 @@ jobs:
           </manifest>
           EOF
 
-      - name: Sync sources
+      - name: Sync sources (low concurrency with retries)
         run: |
           cd ~/android/lineage
           set -o pipefail
-          repo sync \
-            --current-branch \
-            --no-clone-bundle \
-            --no-tags \
-            --optimized-fetch \
-            -j$(nproc --all) \
-            2>&1 | tee /tmp/sync.log
-          [ -d "device/infinix/X6528" ] || (echo "device tree missing!" && exit 1)
+
+          # Google/AOSP can temporarily reject parallel fetches with
+          # RESOURCE_EXHAUSTED. Limit network pressure and retry safely.
+          synced=0
+          for attempt in 1 2 3 4; do
+            echo "=== Repo sync attempt $attempt/4 ==="
+            if repo sync \
+              --current-branch \
+              --no-clone-bundle \
+              --no-tags \
+              --optimized-fetch \
+              --fail-fast \
+              -j2 \
+              2>&1 | tee "/tmp/sync-attempt-$attempt.log"; then
+              synced=1
+              break
+            fi
+
+            if [ "$attempt" -lt 4 ]; then
+              delay=$((attempt * 60))
+              echo "Repo sync failed; waiting ${delay}s before retry..."
+              sleep "$delay"
+            fi
+          done
+
+          if [ "$synced" -ne 1 ]; then
+            echo "Repo sync failed after 4 attempts."
+            exit 1
+          fi
+
+          [ -d "device/infinix/X6528" ] || { echo "device tree missing!"; exit 1; }
 
       - name: Fix duplicate modules in Android.bp
         run: |
