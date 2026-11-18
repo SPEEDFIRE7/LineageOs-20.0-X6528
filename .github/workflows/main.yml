@@ -11,6 +11,10 @@ on:
         description: 'Clean build? (true/false)'
         required: true
         default: 'false'
+      kernel_branch:
+        description: 'Kernel branch name'
+        required: true
+        default: 'master'
 
 permissions:
   contents: write
@@ -70,7 +74,7 @@ jobs:
       - name: Create local manifests
         run: |
           mkdir -p ~/android/lineage/.repo/local_manifests
-          cat > ~/android/lineage/.repo/local_manifests/x6528.xml << 'EOF'
+          cat > ~/android/lineage/.repo/local_manifests/x6528.xml << EOF
           <?xml version="1.0" encoding="UTF-8"?>
           <manifest>
             <project name="SPEEDFIRE7/android_device_infinix_X6528"
@@ -80,7 +84,7 @@ jobs:
             <project name="SPEEDFIRE7/android_kernel_infinix_X6528"
                      path="kernel/infinix/X6528"
                      remote="github"
-                     revision="lineage-20" />
+                     revision="${{ github.event.inputs.kernel_branch }}" />
           </manifest>
           EOF
 
@@ -93,7 +97,55 @@ jobs:
             --no-tags \
             --optimized-fetch \
             -j$(nproc --all) \
-            2>&1 | tee /tmp/sync.log
+            2>&1 | tee /tmp/sync.log || true
+          [ -d "device/infinix/X6528" ] || (echo "device tree missing!" && exit 1)
+          [ -d "kernel/infinix/X6528" ] || (echo "kernel missing!" && exit 1)
+
+      - name: Fix duplicate modules in Android.bp
+        run: |
+          BP="$HOME/android/lineage/device/infinix/X6528/rootdir/Android.bp"
+          python3 - "$BP" << 'PYEOF'
+          import sys, re
+          path = sys.argv[1]
+          with open(path, "r") as f:
+              content = f.read()
+          pattern = re.compile(r'prebuilt_etc\s*\{[^}]*\}', re.DOTALL)
+          matches = list(pattern.finditer(content))
+          seen = set()
+          to_remove = []
+          for m in reversed(matches):
+              name_match = re.search(r'name:\s*"([^"]+)"', m.group(0))
+              if not name_match:
+                  continue
+              name = name_match.group(1)
+              if name in seen:
+                  to_remove.append((m.start(), m.end()))
+                  print(f"Removed duplicate: {name}")
+              else:
+                  seen.add(name)
+          result = list(content)
+          for start, end in to_remove:
+              for i in range(start, end):
+                  result[i] = ""
+          content = "".join(result)
+          with open(path, "w") as f:
+              f.write(content)
+          print("Done. No more duplicates.")
+          PYEOF
+
+      - name: Fix TARGET_KERNEL_CONFIG
+        run: |
+          BC="$HOME/android/lineage/device/infinix/X6528/BoardConfig.mk"
+          if grep -q "TARGET_KERNEL_CONFIG" "$BC"; then
+            echo "Already defined:"
+            grep "TARGET_KERNEL_CONFIG" "$BC"
+          else
+            echo "" >> "$BC"
+            echo "# Kernel config" >> "$BC"
+            echo "TARGET_KERNEL_CONFIG := bg6_defconfig" >> "$BC"
+            echo "TARGET_KERNEL_SOURCE := kernel/infinix/X6528" >> "$BC"
+            echo "Injected TARGET_KERNEL_CONFIG := bg6_defconfig"
+          fi
 
       - name: Download vendor blobs from release
         env:
@@ -110,7 +162,6 @@ jobs:
           ls -lh /tmp/vendor_dl/
 
           if ls /tmp/vendor_dl/vendor_blobs.tar.gz.part_* &>/dev/null; then
-            echo "Reassembling parts..."
             cat /tmp/vendor_dl/vendor_blobs.tar.gz.part_* > /tmp/vendor_dl/vendor_blobs.tar.gz
           fi
 
