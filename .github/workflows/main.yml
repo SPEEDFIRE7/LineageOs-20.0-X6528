@@ -183,13 +183,21 @@ jobs:
           lunch lineage_X6528-${{ github.event.inputs.build_type }}
           make clean
 
-      - name: Build LineageOS
+      - name: Verify prebuilt kernel (skip kernel compilation)
         run: |
           cd ~/android/lineage
+          test -s device/infinix/X6528/prebuilts/kernel || { echo "Prebuilt kernel is missing"; exit 1; }
+          test -s device/infinix/X6528/prebuilts/dtb.img || { echo "Prebuilt DTB is missing"; exit 1; }
+          echo "Using the device-tree prebuilt kernel; kernel source compilation is disabled."
+
+      - name: Build LineageOS (without building kernel)
+        run: |
+          cd ~/android/lineage
+          export TARGET_FORCE_PREBUILT_KERNEL=true
           source build/envsetup.sh
           lunch lineage_X6528-${{ github.event.inputs.build_type }}
           set -o pipefail
-          make bacon -j$(nproc --all) 2>&1 | tee /tmp/build.log
+          make bacon TARGET_FORCE_PREBUILT_KERNEL=true -j$(nproc --all) 2>&1 | tee /tmp/build.log
           ls -lh out/target/product/X6528/*.zip
 
       - name: Upload ROM to release
