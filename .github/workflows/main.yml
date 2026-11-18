@@ -147,31 +147,32 @@ jobs:
 
           ls ~/android/lineage/vendor/infinix/X6528/
 
-      - name: Remove duplicate face-default.xml
+      -       - name: Remove face-default duplicate (module + package entry)
         run: |
           cd ~/android/lineage
-          echo "=== References before ==="
-          grep -rn "face-default" device/infinix/X6528 vendor/infinix/X6528 \
-            --include=*.mk --include=*.bp --include=*.txt || echo "(none)"
+          V=vendor/infinix/X6528
 
-          find vendor/infinix/X6528 -name 'face-default.xml' -print -delete
+          echo "=== Before ==="
+          grep -rn "face-default" device/infinix/X6528 $V \
+            --include=*.mk --include=*.bp || true
+          sed -n '180,190p' device/infinix/X6528/BoardConfig.mk
 
-          for f in $(grep -rl "face-default" device/infinix/X6528 vendor/infinix/X6528 \
-                     --include=*.mk --include=*.txt 2>/dev/null); do
-            sed -i '/face-default/d' "$f"
-          done
+          # 1) remove the prebuilt_etc "face-default" module from vendor Android.bp
+          python3 - "$V/Android.bp" << 'PYEOF'
+          import re, sys
+          p = sys.argv[1]
+          s = open(p).read()
+          s2, n = re.subn(r'prebuilt_etc\s*\{[^}]*name:\s*"face-default"[^}]*\}\s*', '', s)
+          open(p, 'w').write(s2)
+          print(f"removed {n} face-default module(s)")
+          PYEOF
 
-          grep -rn "face-default" device/infinix/X6528 vendor/infinix/X6528 \
-            --include=*.bp || true
+          # 2) remove it from PRODUCT_PACKAGES
+          sed -i '/^[[:space:]]*face-default[[:space:]]*\\$/d' $V/X6528-vendor.mk
 
-          echo "=== References after ==="
-          grep -rn "face-default" device/infinix/X6528 vendor/infinix/X6528 || echo "(none)"
-
-      - name: Show prebuilt kernel config
-        run: |
-          cd ~/android/lineage
-          grep -rn -E "PREBUILT_KERNEL|FORCE_PREBUILT|PREBUILT_DTB|PREBUILT_DTBO" \
-            device/infinix/X6528 || echo "(no prebuilt kernel lines found!)"
+          echo "=== After ==="
+          grep -rn "face-default" device/infinix/X6528 $V \
+            --include=*.mk --include=*.bp || echo "(none)"
 
       - name: Clean if requested
         if: github.event.inputs.clean_build == 'true'
