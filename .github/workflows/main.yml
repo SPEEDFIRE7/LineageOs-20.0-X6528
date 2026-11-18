@@ -147,7 +147,7 @@ jobs:
 
           ls ~/android/lineage/vendor/infinix/X6528/
 
-      -       - name: Remove face-default duplicate (module + package entry)
+      - name: Remove face-default duplicate (module + package entry)
         run: |
           cd ~/android/lineage
           V=vendor/infinix/X6528
@@ -198,3 +198,8 @@ jobs:
           cd ~/android/lineage
           ZIP=$(ls out/target/product/X6528/lineage-*.zip 2>/dev/null | head -1)
           [ -z "$ZIP" ] && echo "No zip found!" && exit 1
+          TAG="lineage20-x6528-$(date +%Y%m%d-%H%M)"
+          gh release create "$TAG" "$ZIP" \
+            --repo "${{ github.repository }}" \
+            --title "LineageOS 20 X6528 - $(date +%Y-%m-%d)" \
+            --notes "Build type: ${{ github.event.inputs.build_type }}"
