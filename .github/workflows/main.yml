@@ -1,231 +1,182 @@
-name: Build LineageOS 20 - Infinix X6528
+name: Build Kernel
 
 on:
   workflow_dispatch:
-    inputs:
-      build_type:
-        description: 'Build type (userdebug/user/eng)'
-        required: true
-        default: 'userdebug'
-      clean_build:
-        description: 'Clean build? (true/false)'
-        required: true
-        default: 'false'
-      kernel_branch:
-        description: 'Kernel branch name'
-        required: true
-        default: 'master'
-
-permissions:
-  contents: write
+  push:
+    branches: [ upstream-302, master, susfs, susfs-testing ]
 
 jobs:
   build:
-    runs-on: namespace-profile-speed
-    timeout-minutes: 720
-
+    runs-on: ubuntu-22.04
+    env:
+      # NB: keep this a literal -- the `runner` context is not available in
+      # jobs.<id>.env, and referencing it there fails workflow validation.
+      CLANG_DIR: /tmp/clang-r416183b
+      # Mirror of what the vendor's own build config uses:
+      #
+      #   build.config.common : LLVM=1
+      #                         CLANG_PREBUILT_BIN=.../clang-r416183b/bin
+      #   build.config.aarch64: ARCH=arm64
+      #                         LLVM_IAS=1
+      #                         CROSS_COMPILE=aarch64-linux-gnu-
+      #
+      # The CROSS_COMPILE prefix is load-bearing: it is what supplies clang's
+      # target triple.  With ARCH=arm64 alone clang still compiles for the
+      # host, and the arm64 inline asm dies with
+      # "unknown register name 'x0' in asm" in asm/atomic_lse.h.
+      MAKE_ARGS: LLVM=1 LLVM_IAS=1 ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- O=out
     steps:
-      - name: Setup build environment
-        run: |
-          sudo apt-get update -qq
-          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
-            bc bison build-essential ccache curl flex \
-            g++-multilib gcc-multilib git gnupg gperf imagemagick \
-            lib32readline-dev lib32z1-dev liblz4-tool \
-            libncurses-dev libsdl1.2-dev libssl-dev \
-            libxml2 libxml2-utils lzop pngcrush rsync schedtool \
-            squashfs-tools xsltproc zip zlib1g-dev \
-            python3 python3-pip openjdk-11-jdk repo git-lfs pigz
-          pip3 install --upgrade pip --break-system-packages
-
-      - name: Configure git
-        run: |
-          git config --global user.email "build@github.com"
-          git config --global user.name "GitHub Actions"
-          git config --global color.ui false
-
-      - name: Setup ccache
-        run: |
-          mkdir -p ~/.ccache
-          ccache -M 50G
-          ccache -o compression=true
-          echo "CCACHE_DIR=$HOME/.ccache" >> $GITHUB_ENV
-          echo "USE_CCACHE=1" >> $GITHUB_ENV
-          echo "CCACHE_EXEC=$(which ccache)" >> $GITHUB_ENV
-
-      - name: Cache ccache
-        uses: actions/cache@v4
+      - name: Checkout
+        uses: actions/checkout@v4
         with:
-          path: ~/.ccache
-          key: ccache-lineage20-x6528-${{ github.run_id }}
-          restore-keys: |
-            ccache-lineage20-x6528-
+          # drivers/kernelsu is a symlink into the KernelSU submodule
+          # (backslashxx/KernelSU), and the top-level Makefile is what pulls it
+          # in (drivers/Makefile: obj-$(CONFIG_KSU) += kernelsu/).  Without this
+          # the link dangles and the build dies with
+          # "drivers/kernelsu: No such file or directory".
+          submodules: recursive
 
-      - name: Initialize LineageOS 20 repo
+      # xxksu (backslashxx/KernelSU) reports its full name via git
+      # (see KSU_FULL_NAME_FORMAT, default "%TAG_NAME%-%COMMIT_SHA%").  A shallow,
+      # tag-less submodule checkout would fall back to a placeholder; unshallow
+      # and pull tags so the driver reports its real version.
+      - name: Expand KernelSU submodule history and tags
         run: |
-          mkdir -p ~/android/lineage
-          cd ~/android/lineage
-          repo init \
-            --depth=1 \
-            -u https://github.com/LineageOS/android.git \
-            -b lineage-20.0 \
-            --git-lfs
+          git -C KernelSU fetch --unshallow --tags
 
-      - name: Create local manifests
+      - name: Install build dependencies
         run: |
-          mkdir -p ~/android/lineage/.repo/local_manifests
-          cat > ~/android/lineage/.repo/local_manifests/x6528.xml << EOF
-          <?xml version="1.0" encoding="UTF-8"?>
-          <manifest>
-            <project name="SPEEDFIRE7/android_device_infinix_X6528"
-                     path="device/infinix/X6528"
-                     remote="github"
-                     revision="lineage-20" />
-            <project name="SPEEDFIRE7/android_kernel_infinix_X6528"
-                     path="kernel/infinix/X6528"
-                     remote="github"
-                     revision="${{ github.event.inputs.kernel_branch }}" />
-          </manifest>
-          EOF
+          sudo apt-get update
+          # libc6-dev-arm64-cross supplies /usr/aarch64-linux-gnu/include, which
+          # usr/include/Makefile adds to the UAPI header self-test.  That test is
+          # cross-compiled with a bare AOSP clang and no sysroot, so without it
+          # every UAPI header that includes a libc header (linux/virtio_ring.h ->
+          # <stdint.h>, linux/dvb/video.h -> <time.h>) fails on a missing
+          # glibc multilib header ('bits/libc-header-start.h',
+          # 'bits/wordsize.h').  See the comment in usr/include/Makefile.
+          sudo apt-get install -y flex bison bc cpio libssl-dev xz-utils dwarves \
+            libc6-dev-arm64-cross
 
-      - name: Sync sources
+      - name: Fetch the reference toolchain (clang-r416183b)
         run: |
-          cd ~/android/lineage
-          repo sync \
-            --current-branch \
-            --no-clone-bundle \
-            --no-tags \
-            --optimized-fetch \
-            -j$(nproc --all) \
-            2>&1 | tee /tmp/sync.log || true
-          [ -d "device/infinix/X6528" ] || (echo "device tree missing!" && exit 1)
-          [ -d "kernel/infinix/X6528" ] || (echo "kernel missing!" && exit 1)
+          curl -sSL -o /tmp/clang.tar.gz \
+            https://codeload.github.com/LineageOS/android_prebuilts_clang_kernel_linux-x86_clang-r416183b/tar.gz/refs/heads/lineage-20.0
+          mkdir -p "$CLANG_DIR"
+          tar xzf /tmp/clang.tar.gz -C "$CLANG_DIR" --strip-components=1
+          echo "$CLANG_DIR/bin" >> "$GITHUB_PATH"
 
-      - name: Fix duplicate modules in Android.bp
+      - name: Show toolchain
         run: |
-          BP="$HOME/android/lineage/device/infinix/X6528/rootdir/Android.bp"
-          python3 - "$BP" << 'PYEOF'
-          import sys, re
-          path = sys.argv[1]
-          with open(path, "r") as f:
-              content = f.read()
-          pattern = re.compile(r'prebuilt_etc\s*\{[^}]*\}', re.DOTALL)
-          matches = list(pattern.finditer(content))
-          seen = set()
-          to_remove = []
-          for m in reversed(matches):
-              name_match = re.search(r'name:\s*"([^"]+)"', m.group(0))
-              if not name_match:
-                  continue
-              name = name_match.group(1)
-              if name in seen:
-                  to_remove.append((m.start(), m.end()))
-                  print(f"Removed duplicate: {name}")
-              else:
-                  seen.add(name)
-          result = list(content)
-          for start, end in to_remove:
-              for i in range(start, end):
-                  result[i] = ""
-          content = "".join(result)
-          with open(path, "w") as f:
-              f.write(content)
-          print("Done. No more duplicates.")
-          PYEOF
+          clang --version
+          ld.lld --version
+          llvm-ar --version | head -1
 
-      - name: Fix TARGET_KERNEL_CONFIG
+      - name: Show kernel release
         run: |
-          BC="$HOME/android/lineage/device/infinix/X6528/BoardConfig.mk"
-          if grep -q "TARGET_KERNEL_CONFIG" "$BC"; then
-            echo "Already defined:"
-            grep "TARGET_KERNEL_CONFIG" "$BC"
-          else
-            echo "" >> "$BC"
-            echo "# Kernel config" >> "$BC"
-            echo "TARGET_KERNEL_CONFIG := bg6_defconfig" >> "$BC"
-            echo "TARGET_KERNEL_SOURCE := kernel/infinix/X6528" >> "$BC"
-            echo "Injected TARGET_KERNEL_CONFIG := bg6_defconfig"
-          fi
+          make $MAKE_ARGS bg6_defconfig
+          echo "kernelrelease: $(make $MAKE_ARGS -s kernelrelease)"
 
-      - name: Download vendor blobs from release
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build Image
         run: |
-          mkdir -p ~/android/lineage/vendor/infinix/X6528
-          mkdir -p /tmp/vendor_dl
+          make $MAKE_ARGS -j$(nproc) Image
 
-          gh release download vendor-blobs \
-            --repo SPEEDFIRE7/android_vendor_infinix_X6528 \
-            --pattern "vendor_blobs*" \
-            --dir /tmp/vendor_dl
-
-          ls -lh /tmp/vendor_dl/
-
-          if ls /tmp/vendor_dl/vendor_blobs.tar.gz.part_* &>/dev/null; then
-            cat /tmp/vendor_dl/vendor_blobs.tar.gz.part_* > /tmp/vendor_dl/vendor_blobs.tar.gz
-          fi
-
-          tar -I pigz -xf /tmp/vendor_dl/vendor_blobs.tar.gz \
-            -C ~/android/lineage/vendor/infinix/X6528
-
-          ls ~/android/lineage/vendor/infinix/X6528/
-
-      - name: Setup build
+      # Mali GPU driver (mali_kbase.ko) is NOT part of the in-tree kernel build:
+      # it lives in kernel_modules/.../gpu/natt/mali and is built out-of-tree via
+      # its own Makefile against the just-built O=out tree. It carries the GPU
+      # OC/DVFS changes (T606_GPLL_FREQ in platform/qogirl6).
+      #
+      # Config notes:
+      #  - The driver is built as the Job Manager (JM) interface, NOT CSF: the
+      #    stock mali_kbase.ko pulled from the device's /vendor_dlkm defines the
+      #    JM scheduler/dispatcher (kbase_jd_submit, kbase_js_*: 11 T kbase_jd_*,
+      #    14 T kbase_js_*), kbase_dump_atoms and kbase_trace_gpu_work_period,
+      #    with no kbase_csf_* symbols - the T606 GPU is Bifrost-class (JM) and
+      #    the vendor userspace (libmali) speaks the JM kbase UAPI. Building
+      #    MALI_USE_CSF=1 is unusable anyway: JM-only objects (mali_kbase_jd.c,
+      #    mali_kbase_js.c) are excluded by Kbuild:273-288, yet always-built code
+      #    (core_linux dump/boost ioctls, trace_gpu_mem.c kbase_trace_gpu_work_period)
+      #    touches struct kbase_jd_atom / kctx->jctx, which only exist in JM builds.
+      #  - CONFIG_MALI_DEVFREQ=y: required to compile - several always-built files
+      #    (mali_kbase_gpu_utilisation_debugfs.c, gpu_stats_debugfs.c, backend
+      #    pm_backend/pm_statistics/pm_ca, core_linux suspend) reference struct
+      #    kbase_device members that only exist under CONFIG_MALI_DEVFREQ (e.g.
+      #    last_frequtil_metrics). Matches the vendor default (Kbuild:86-90
+      #    auto-sets it when PM_DEVFREQ + simple_ondemand are =y; the stock ko
+      #    imports devfreq_* and create/destroy_gpu_cooling_device). At runtime
+      #    devfreq only registers if the DT has operating-points-v2; SPRD instead
+      #    scales via the platform DVFS, so this is compile parity with stock.
+      #    CONFIG_MALI_MIDGARD_DVFS stays OFF on purpose: the stock ko does NOT
+      #    import kbase_platform_dvfs_event, and qogirl6 has no implementation of
+      #    it (its governor hooks via kbase_platform_modify_target_freq instead).
+      #    With MIDGARD_DVFS=y the call in mali_kbase_pm_metrics.c
+      #    (kbase_pm_get_dvfs_action) has no provider and modpost fails.
+      #  - mali_kbase.ko imports from two sibling modules, matching the stock
+      #    ko's "depends: sprd_gpu_cooling,trusty":
+      #      create/destroy_gpu_cooling_device <- drivers/thermal/sprd_gpu_cooling.ko
+      #      trusty_fast_call32                  <- drivers/trusty/trusty.ko
+      #    They are built right before the mali module so modpost can resolve
+      #    the imports (out/Module.symvers records their exports; the mali
+      #    build itself is a standalone external-module build).
+      #  - CONFIG_MALI_GATOR_SUPPORT=n -> no external gator profiler dependency
+      #  - MALI_JIT_PRESSURE_LIMIT_BASE=0 -> matches the vendor build (Kbuild
+      #    defaults it to 1).
+      #
+      # Kernel .config requirements (all already =y in bg6_defconfig): ANDROID,
+      # DMA_SHARED_BUFFER, PM_DEVFREQ, DEVFREQ_THERMAL, DEVFREQ_GOV_SIMPLE_ONDEMAND,
+      # FW_LOADER, SYNC_FILE. GPU_TRACEPOINTS is not defined in this tree, so the
+      # Kbuild guard sees it as unset rather than 'n' and passes.
+      - name: Build Mali GPU module (mali_kbase.ko)
         run: |
-          cd ~/android/lineage
-          source build/envsetup.sh
-          lunch lineage_X6528-${{ github.event.inputs.build_type }}
+          make $MAKE_ARGS modules_prepare
+          # Build the modules mali_kbase.ko links against (stock ko shows
+          # "depends: sprd_gpu_cooling,trusty") so modpost can resolve their
+          # exports: create/destroy_gpu_cooling_device (sprd_gpu_cooling.ko)
+          # and trusty_fast_call32 (trusty.ko). Their exports land in
+          # out/Module.symvers, which the external mali build reads.
+          make $MAKE_ARGS -j$(nproc) drivers/thermal/sprd_gpu_cooling.ko drivers/trusty/trusty.ko
+          make -C kernel_modules/kernel5.4/gpu/natt/mali \
+            KDIR=$PWD/out \
+            LLVM=1 LLVM_IAS=1 ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- \
+            CONFIG_MALI_MIDGARD=m \
+            CONFIG_MALI_PLATFORM_NAME=qogirl6 \
+            CONFIG_MALI_CSF_SUPPORT=n \
+            MALI_USE_CSF=0 \
+            CONFIG_MALI_DEVFREQ=y \
+            CONFIG_MALI_GATOR_SUPPORT=n \
+            MALI_JIT_PRESSURE_LIMIT_BASE=0
 
-      - name: Clean if requested
-        if: github.event.inputs.clean_build == 'true'
+      - name: Pack boot.img (magiskboot)
         run: |
-          cd ~/android/lineage
-          source build/envsetup.sh
-          lunch lineage_X6528-${{ github.event.inputs.build_type }}
-          make clean
+          curl -sSL -o /tmp/magisk.apk \
+            "$(curl -s https://api.github.com/repos/topjohnwu/Magisk/releases/latest \
+               | jq -r '.assets[] | select(.name | endswith(".apk")) | .browser_download_url' \
+               | head -1)"
+          unzip -o -j /tmp/magisk.apk 'lib/x86_64/libmagiskboot.so' -d /tmp
+          chmod +x /tmp/libmagiskboot.so
+          mkdir -p /tmp/bootwork && cd /tmp/bootwork
+          /tmp/libmagiskboot.so unpack "$GITHUB_WORKSPACE/boot-gsi.img"
+          cp "$GITHUB_WORKSPACE/out/arch/arm64/boot/Image" kernel
+          /tmp/libmagiskboot.so repack "$GITHUB_WORKSPACE/boot-gsi.img"
+          mv new-boot.img "$GITHUB_WORKSPACE/boot.img"
+          ls -la "$GITHUB_WORKSPACE/boot.img"
 
-      - name: Build LineageOS
-        run: |
-          cd ~/android/lineage
-          source build/envsetup.sh
-          lunch lineage_X6528-${{ github.event.inputs.build_type }}
-          make bacon -j$(nproc --all) 2>&1 | tee /tmp/build.log
-          ls -lh out/target/product/X6528/*.zip
-
-      - name: Upload ROM to release
-        if: success()
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          cd ~/android/lineage
-          ZIP=$(ls out/target/product/X6528/lineage-*.zip 2>/dev/null | head -1)
-          [ -z "$ZIP" ] && echo "No zip found!" && exit 1
-
-          SIZE=$(du -sh "$ZIP" | cut -f1)
-          DATE=$(date +%Y%m%d)
-          TAG="lineage-20-${DATE}"
-
-          gh release create "$TAG" "$ZIP" \
-            --repo SPEEDFIRE7/android_vendor_infinix_X6528 \
-            --title "LineageOS 20 - Infinix X6528 (${DATE})" \
-            --notes "## LineageOS 20 — Infinix Hot 40i (X6528)
-
-          - **Device**: Infinix Hot 40i (X6528)
-          - **Chipset**: Unisoc T606
-          - **Android**: 13 (LineageOS 20)
-          - **Build type**: ${{ github.event.inputs.build_type }}
-          - **Build date**: ${DATE}
-          - **Size**: ${SIZE}
-
-          ### Installation
-          1. Boot to recovery
-          2. Flash the ZIP
-          3. Wipe data if upgrading from stock"
-
-      - name: Upload build log on failure
-        if: failure()
+      - name: Upload build output
         uses: actions/upload-artifact@v4
         with:
-          name: build-log-${{ github.run_id }}
-          path: /tmp/build.log
-          retention-days: 7
+          name: kernel-Image-${{ github.sha }}
+          path: out/arch/arm64/boot/Image
+          if-no-files-found: warn
+
+      - name: Upload mali_kbase module
+        uses: actions/upload-artifact@v4
+        with:
+          name: mali_kbase-${{ github.sha }}
+          path: kernel_modules/kernel5.4/gpu/natt/mali/mali_kbase.ko
+          if-no-files-found: warn
+
+      - name: Upload boot.img
+        uses: actions/upload-artifact@v4
+        with:
+          name: boot-${{ github.sha }}
+          path: boot.img
+          if-no-files-found: error
