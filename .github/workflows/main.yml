@@ -83,13 +83,14 @@ jobs:
       - name: Sync sources
         run: |
           cd ~/android/lineage
+          set -o pipefail
           repo sync \
             --current-branch \
             --no-clone-bundle \
             --no-tags \
             --optimized-fetch \
             -j$(nproc --all) \
-            2>&1 | tee /tmp/sync.log || true
+            2>&1 | tee /tmp/sync.log
           [ -d "device/infinix/X6528" ] || (echo "device tree missing!" && exit 1)
 
       - name: Fix duplicate modules in Android.bp
@@ -100,7 +101,7 @@ jobs:
           path = sys.argv[1]
           with open(path, "r") as f:
               content = f.read()
-          pattern = re.compile(r'prebuilt_etc\s*\{[^}]*\}', re.DOTALL)
+          pattern = re.compile(r'prebuilt_etc(?:_xml)?\s*\{[^}]*\}', re.DOTALL)
           matches = list(pattern.finditer(content))
           seen = set()
           to_remove = []
@@ -162,7 +163,7 @@ jobs:
           import re, sys
           p = sys.argv[1]
           s = open(p).read()
-          s2, n = re.subn(r'prebuilt_etc\s*\{[^}]*name:\s*"face-default"[^}]*\}\s*', '', s)
+          s2, n = re.subn(r'prebuilt_etc(?:_xml)?\s*\{[^}]*?name:\s*"face-default"[^}]*?\}\s*', '', s, flags=re.DOTALL)
           open(p, 'w').write(s2)
           print(f"removed {n} face-default module(s)")
           PYEOF
@@ -187,6 +188,7 @@ jobs:
           cd ~/android/lineage
           source build/envsetup.sh
           lunch lineage_X6528-${{ github.event.inputs.build_type }}
+          set -o pipefail
           make bacon -j$(nproc --all) 2>&1 | tee /tmp/build.log
           ls -lh out/target/product/X6528/*.zip
 
