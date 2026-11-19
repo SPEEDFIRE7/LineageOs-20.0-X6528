@@ -108,20 +108,45 @@ jobs:
         run: |
           cd ~/android/lineage
           V=vendor/infinix/X6528
-          python3 - "$V/Android.bp" << 'PYEOF'
+          python3 - "$V/Android.bp" "$V/X6528-vendor.mk" << 'PYEOF'
           import re, sys
-          p = sys.argv[1]
-          s = open(p).read()
+          bp_path, mk_path = sys.argv[1:3]
+          bp = open(bp_path).read()
+          mk = open(mk_path).read()
+
+          # These XML files are already included through DEVICE_MANIFEST_FILE
+          # in the device BoardConfig. Remove the duplicate Soong install modules
+          # and their PRODUCT_PACKAGES entries, but keep the manifest XML files.
           for name in ("face-default",
                        "android.hardware.biometrics.fingerprint@2.1-service"):
-              pattern = (r'prebuilt_etc(?:_xml)?\\s*\\{[^}]*?name:\\s*"' +
-                         re.escape(name) + r'"[^}]*?\\}\\s*')
-              s, n = re.subn(pattern, '', s, flags=re.DOTALL)
-              print(f"removed {n} Soong definition(s): {name}")
-          open(p, "w").write(s)
+              pattern = (r'(?ms)^prebuilt_etc(?:_xml)?\\s*\\{'
+                         r'(?:(?!^\\}).)*?^\\s*name:\\s*"' +
+                         re.escape(name) +
+                         r'"[^\\n]*\\n(?:(?!^\\}).)*?^\\}\\s*')
+              bp, count = re.subn(pattern, '', bp)
+              print(f"Removed {count} Soong module(s): {name}")
+              if count != 1:
+                  raise SystemExit(f"Expected exactly one Soong module for {name}, got {count}")
+
+              lines = mk.splitlines(keepends=True)
+              kept = []
+              removed = 0
+              for line in lines:
+                  if line.strip() in (name, name + " \\"):
+                      removed += 1
+                      continue
+                  kept.append(line)
+              mk = ''.join(kept)
+              print(f"Removed {removed} PRODUCT_PACKAGES entry/entries: {name}")
+              if removed != 1:
+                  raise SystemExit(f"Expected exactly one PRODUCT_PACKAGES entry for {name}, got {removed}")
+
+          open(bp_path, "w").write(bp)
+          open(mk_path, "w").write(mk)
           PYEOF
-          sed -i '/^[[:space:]]*face-default[[:space:]]*\\$/d' "$V/X6528-vendor.mk"
-          sed -i '/^[[:space:]]*android\\.hardware\\.biometrics\\.fingerprint@2\\.1-service[[:space:]]*\\$/d' "$V/X6528-vendor.mk"
+          echo "Checking duplicate VINTF module workaround:"
+          ! grep -nE 'name: "(face-default|android.hardware.biometrics.fingerprint@2.1-service)"' "$V/Android.bp"
+          ! grep -nE '^    (face-default|android.hardware.biometrics.fingerprint@2.1-service) \\\\$' "$V/X6528-vendor.mk"
 
       - name: Validate recovery inputs
         run: |
