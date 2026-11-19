@@ -117,7 +117,8 @@ jobs:
           # BoardConfig already includes these XMLs via DEVICE_MANIFEST_FILE.
           # Remove only the duplicate Soong install modules and package entries.
           for name in ("face-default",
-                       "android.hardware.biometrics.fingerprint@2.1-service"):
+                       "android.hardware.biometrics.fingerprint@2.1-service",
+                       "bluetooth_audio"):
               removed = 0
               def drop_module(match):
                   nonlocal_dummy = None
