@@ -1,0 +1,171 @@
+name: Build LineageOS 20 Recovery - Infinix X6528
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  recovery:
+    runs-on: namespace-profile-speed
+    timeout-minutes: 720
+
+    steps:
+      - name: Setup build environment
+        run: |
+          sudo apt-get update -qq
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
+            bc bison build-essential ccache curl flex \
+            g++-multilib gcc-multilib git gnupg gperf imagemagick \
+            lib32readline-dev lib32z1-dev liblz4-tool \
+            libncurses-dev libsdl1.2-dev libssl-dev \
+            libxml2 libxml2-utils lzop pngcrush rsync schedtool \
+            squashfs-tools xsltproc zip zlib1g-dev \
+            python3 python3-pip openjdk-11-jdk repo git-lfs pigz gh
+
+      - name: Configure git and ccache
+        run: |
+          git config --global user.email "build@github.com"
+          git config --global user.name "GitHub Actions"
+          git config --global color.ui false
+          mkdir -p ~/.ccache
+          ccache -M 50G
+          ccache -o compression=true
+          echo "CCACHE_DIR=$HOME/.ccache" >> "$GITHUB_ENV"
+          echo "USE_CCACHE=1" >> "$GITHUB_ENV"
+          echo "CCACHE_EXEC=$(which ccache)" >> "$GITHUB_ENV"
+
+      - name: Restore ccache
+        uses: actions/cache@v4
+        with:
+          path: ~/.ccache
+          key: ccache-lineage20-recovery-x6528-${{ github.run_id }}
+          restore-keys: |
+            ccache-lineage20-recovery-x6528-
+            ccache-lineage20-x6528-
+
+      - name: Initialize LineageOS 20
+        run: |
+          mkdir -p ~/android/lineage
+          cd ~/android/lineage
+          repo init --depth=1 \
+            -u https://github.com/LineageOS/android.git \
+            -b lineage-20.0 --git-lfs
+
+      - name: Add X6528 device tree
+        run: |
+          mkdir -p ~/android/lineage/.repo/local_manifests
+          cat > ~/android/lineage/.repo/local_manifests/x6528.xml << 'EOF'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <manifest>
+            <project name="SPEEDFIRE7/android_device_infinix_X6528"
+                     path="device/infinix/X6528"
+                     remote="github"
+                     revision="lineage-20" />
+          </manifest>
+          EOF
+
+      - name: Sync sources (retry on transient failures)
+        run: |
+          cd ~/android/lineage
+          set -o pipefail
+          synced=0
+          for attempt in 1 2 3 4; do
+            echo "=== Repo sync attempt $attempt/4 ==="
+            if repo sync --current-branch --no-clone-bundle --no-tags \
+              --optimized-fetch --fail-fast -j2 \
+              2>&1 | tee "/tmp/recovery-sync-$attempt.log"; then
+              synced=1
+              break
+            fi
+            if [ "$attempt" -lt 4 ]; then
+              delay=$((attempt * 60))
+              echo "Sync failed; retrying in ${delay}s"
+              sleep "$delay"
+            fi
+          done
+          [ "$synced" -eq 1 ] || { echo "Repo sync failed"; exit 1; }
+          test -d device/infinix/X6528
+
+      - name: Download and extract X6528 vendor blobs
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          mkdir -p ~/android/lineage/vendor/infinix/X6528 /tmp/vendor_dl
+          gh release download vendor-blobs \
+            --repo SPEEDFIRE7/android_vendor_infinix_X6528 \
+            --pattern "vendor_blobs*" --dir /tmp/vendor_dl
+          if ls /tmp/vendor_dl/vendor_blobs.tar.gz.part_* >/dev/null 2>&1; then
+            cat /tmp/vendor_dl/vendor_blobs.tar.gz.part_* > /tmp/vendor_dl/vendor_blobs.tar.gz
+          fi
+          test -s /tmp/vendor_dl/vendor_blobs.tar.gz
+          tar -I pigz -xf /tmp/vendor_dl/vendor_blobs.tar.gz \
+            -C ~/android/lineage/vendor/infinix/X6528
+          test -s ~/android/lineage/vendor/infinix/X6528/Android.bp
+
+      - name: Apply known duplicate VINTF module workaround
+        run: |
+          cd ~/android/lineage
+          V=vendor/infinix/X6528
+          python3 - "$V/Android.bp" << 'PYEOF'
+          import re, sys
+          p = sys.argv[1]
+          s = open(p).read()
+          for name in ("face-default",
+                       "android.hardware.biometrics.fingerprint@2.1-service"):
+              pattern = (r'prebuilt_etc(?:_xml)?\\s*\\{[^}]*?name:\\s*"' +
+                         re.escape(name) + r'"[^}]*?\\}\\s*')
+              s, n = re.subn(pattern, '', s, flags=re.DOTALL)
+              print(f"removed {n} Soong definition(s): {name}")
+          open(p, "w").write(s)
+          PYEOF
+          sed -i '/^[[:space:]]*face-default[[:space:]]*\\$/d' "$V/X6528-vendor.mk"
+          sed -i '/^[[:space:]]*android\\.hardware\\.biometrics\\.fingerprint@2\\.1-service[[:space:]]*\\$/d' "$V/X6528-vendor.mk"
+
+      - name: Validate recovery inputs
+        run: |
+          cd ~/android/lineage
+          D=device/infinix/X6528
+          test -s "$D/prebuilts/kernel"
+          test -s "$D/prebuilts/dtb.img"
+          test -s "$D/prebuilts/dtbo.img"
+          test -s "$D/rootdir/etc/fstab.X6528"
+          grep -q '^TARGET_RECOVERY_FSTAB' "$D/BoardConfig.mk"
+          grep -q '^BOARD_MOVE_RECOVERY_RESOURCES_TO_VENDOR_BOOT := true' "$D/BoardConfig.mk"
+          grep -q '^BOARD_INCLUDE_RECOVERY_RAMDISK_IN_VENDOR_BOOT := true' "$D/BoardConfig.mk"
+          echo "Recovery is configured to be packaged in vendor_boot."
+
+      - name: Configure product
+        run: |
+          cd ~/android/lineage
+          export TARGET_FORCE_PREBUILT_KERNEL=true
+          source build/envsetup.sh
+          lunch lineage_X6528-userdebug
+
+      - name: Build vendor_boot image (Recovery)
+        run: |
+          cd ~/android/lineage
+          export TARGET_FORCE_PREBUILT_KERNEL=true
+          source build/envsetup.sh
+          lunch lineage_X6528-userdebug
+          set -o pipefail
+          m vendorbootimage -j"$(nproc --all)" 2>&1 | tee /tmp/vendorboot-build.log
+          IMAGE="out/target/product/X6528/vendor_boot.img"
+          test -s "$IMAGE"
+          mkdir -p recovery-output
+          cp "$IMAGE" recovery-output/vendor_boot.img
+          sha256sum recovery-output/vendor_boot.img | tee recovery-output/SHA256SUMS.txt
+          ls -lh recovery-output/
+
+      - name: Upload Recovery image
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: X6528-LineageOS-20-Recovery-vendor_boot
+          path: |
+            recovery-output/vendor_boot.img
+            recovery-output/SHA256SUMS.txt
+            /tmp/vendorboot-build.log
+          if-no-files-found: warn
+          retention-days: 14
