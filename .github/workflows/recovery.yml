@@ -118,7 +118,8 @@ jobs:
           # Remove only the duplicate Soong install modules and package entries.
           for name in ("face-default",
                        "android.hardware.biometrics.fingerprint@2.1-service",
-                       "bluetooth_audio"):
+                       "bluetooth_audio",
+                       "android.hardware.cas@1.2-service"):
               removed = 0
               def drop_module(match):
                   nonlocal_dummy = None
