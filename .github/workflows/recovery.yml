@@ -114,39 +114,43 @@ jobs:
           bp = open(bp_path).read()
           mk = open(mk_path).read()
 
-          # These XML files are already included through DEVICE_MANIFEST_FILE
-          # in the device BoardConfig. Remove the duplicate Soong install modules
-          # and their PRODUCT_PACKAGES entries, but keep the manifest XML files.
+          # BoardConfig already includes these XMLs via DEVICE_MANIFEST_FILE.
+          # Remove only the duplicate Soong install modules and package entries.
           for name in ("face-default",
                        "android.hardware.biometrics.fingerprint@2.1-service"):
-              pattern = (r'(?ms)^prebuilt_etc(?:_xml)?\\s*\\{'
-                         r'(?:(?!^\\}).)*?^\\s*name:\\s*"' +
-                         re.escape(name) +
-                         r'"[^\\n]*\\n(?:(?!^\\}).)*?^\\}\\s*')
-              bp, count = re.subn(pattern, '', bp)
-              print(f"Removed {count} Soong module(s): {name}")
-              if count != 1:
-                  raise SystemExit(f"Expected exactly one Soong module for {name}, got {count}")
-
-              lines = mk.splitlines(keepends=True)
-              kept = []
               removed = 0
-              for line in lines:
-                  if line.strip() in (name, name + " \\"):
-                      removed += 1
+              def drop_module(match):
+                  nonlocal_dummy = None
+                  global_removed[0] += int(bool(re.search(
+                      r'(?m)^\s*name:\s*"' + re.escape(name) + r'"',
+                      match.group(0))))
+                  return '' if re.search(
+                      r'(?m)^\s*name:\s*"' + re.escape(name) + r'"',
+                      match.group(0)) else match.group(0)
+
+              global_removed = [0]
+              bp = re.sub(r'(?ms)^prebuilt_etc(?:_xml)?\s*\{.*?^\}\s*',
+                          drop_module, bp)
+              removed = global_removed[0]
+              print(f"Removed {removed} Soong module(s): {name}")
+              if removed != 1:
+                  raise SystemExit(f"Expected exactly one Soong module for {name}, got {removed}")
+
+              kept = []
+              package_removed = 0
+              for line in mk.splitlines(keepends=True):
+                  if line.strip().rstrip("\\").strip() == name:
+                      package_removed += 1
                       continue
                   kept.append(line)
               mk = ''.join(kept)
-              print(f"Removed {removed} PRODUCT_PACKAGES entry/entries: {name}")
-              if removed != 1:
-                  raise SystemExit(f"Expected exactly one PRODUCT_PACKAGES entry for {name}, got {removed}")
+              print(f"Removed {package_removed} PRODUCT_PACKAGES entry/entries: {name}")
+              if package_removed != 1:
+                  raise SystemExit(f"Expected exactly one PRODUCT_PACKAGES entry for {name}, got {package_removed}")
 
           open(bp_path, "w").write(bp)
           open(mk_path, "w").write(mk)
           PYEOF
-          echo "Checking duplicate VINTF module workaround:"
-          ! grep -nE 'name: "(face-default|android.hardware.biometrics.fingerprint@2.1-service)"' "$V/Android.bp"
-          ! grep -nE '^    (face-default|android.hardware.biometrics.fingerprint@2.1-service) \\\\$' "$V/X6528-vendor.mk"
 
       - name: Validate recovery inputs
         run: |
