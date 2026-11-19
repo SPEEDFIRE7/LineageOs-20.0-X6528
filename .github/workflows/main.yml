@@ -181,22 +181,30 @@ jobs:
             --include=*.mk --include=*.bp || true
           sed -n '180,190p' device/infinix/X6528/BoardConfig.mk
 
-          # 1) remove the prebuilt_etc "face-default" module from vendor Android.bp
+          # Remove duplicate VINTF prebuilt modules; BoardConfig.mk already
+          # provides these manifests through DEVICE_MANIFEST_FILE.
           python3 - "$V/Android.bp" << 'PYEOF'
           import re, sys
           p = sys.argv[1]
           s = open(p).read()
-          s2, n = re.subn(r'prebuilt_etc(?:_xml)?\s*\{[^}]*?name:\s*"face-default"[^}]*?\}\s*', '', s, flags=re.DOTALL)
-          open(p, 'w').write(s2)
-          print(f"removed {n} face-default module(s)")
+          modules = (
+              "face-default",
+              "android.hardware.biometrics.fingerprint@2.1-service",
+          )
+          for name in modules:
+              pattern = r'prebuilt_etc(?:_xml)?\s*\{[^}]*?name:\s*"' + re.escape(name) + r'"[^}]*?\}\s*'
+              s, n = re.subn(pattern, '', s, flags=re.DOTALL)
+              print(f"removed {n} duplicate Soong module(s): {name}")
+          open(p, 'w').write(s)
           PYEOF
 
-          # 2) remove it from PRODUCT_PACKAGES
+          # Remove matching PRODUCT_PACKAGES entries; keep the manifest in BoardConfig.mk.
           sed -i '/^[[:space:]]*face-default[[:space:]]*\\$/d' $V/X6528-vendor.mk
+          sed -i '/^[[:space:]]*android\.hardware\.biometrics\.fingerprint@2\.1-service[[:space:]]*\\$/d' $V/X6528-vendor.mk
 
-          echo "=== After ==="
-          grep -rn "face-default" device/infinix/X6528 $V \
-            --include=*.mk --include=*.bp || echo "(none)"
+          echo "=== Remaining VINTF references ==="
+          grep -rnE "face-default|android.hardware.biometrics.fingerprint@2.1-service" device/infinix/X6528 $V \
+            --include=*.mk --include=*.bp || true
 
       - name: Clean if requested
         if: github.event.inputs.clean_build == 'true'
